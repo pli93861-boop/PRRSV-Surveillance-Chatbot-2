@@ -1,0 +1,9 @@
+streamlit
+openai>=1.30.0
+langchain-openai
+langchain-community
+langchain-text-splitters
+faiss-cpu
+pypdf
+unstructured
+markdown
