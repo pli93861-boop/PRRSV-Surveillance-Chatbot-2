@@ -7,8 +7,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 from openai import OpenAI
-from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    TextLoader,
+    CSVLoader,
+    UnstructuredMarkdownLoader,
+)
 
 
 # ============================================================
@@ -21,6 +28,8 @@ st.caption("Deployable app with BASE / RAG / AUTO(MMR), guardrails, and citation
 MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma_db")
+FAISS_DIR = os.getenv("FAISS_DIR", "./faiss_index")
+DOCS_DIR = os.getenv("DOCS_DIR", "./docs")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not OPENAI_API_KEY:
@@ -169,15 +178,18 @@ def _throttle_if_needed() -> None:
     _LAST_CALL_TS = time.time()
 
 
-@lru_cache(maxsize=1)
-def load_vectorstore() -> Optional[Chroma]:
-    if not os.path.isdir(CHROMA_DIR):
-        return None
-    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
-    return Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
+def _get_embeddings():
+    return OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
 
 
-def safe_chat_completion(*, model: str, messages: List[Dict[str, str]], max_completion_tokens: int, temperature: float, top_p: float):
+def safe_chat_completion(
+    *,
+    model: str,
+    messages: List[Dict[str, str]],
+    max_completion_tokens: int,
+    temperature: float,
+    top_p: float,
+):
     _throttle_if_needed()
 
     user_blob = "\n".join(str(m.get("content", "")) for m in messages if m.get("role") == "user")
@@ -210,6 +222,134 @@ def safe_chat_completion(*, model: str, messages: List[Dict[str, str]], max_comp
 
 
 # ============================================================
+# Vector store helpers
+# ============================================================
+def _load_docs_from_dir(doc_dir: str) -> List[Any]:
+    docs = []
+    if not os.path.isdir(doc_dir):
+        return docs
+
+    for root, _, files in os.walk(doc_dir):
+        for fname in files:
+            path = os.path.join(root, fname)
+            lower = fname.lower()
+            try:
+                if lower.endswith(".pdf"):
+                    loader = PyPDFLoader(path)
+                    loaded = loader.load()
+                elif lower.endswith(".txt"):
+                    loader = TextLoader(path, encoding="utf-8")
+                    loaded = loader.load()
+                elif lower.endswith(".md"):
+                    loader = UnstructuredMarkdownLoader(path)
+                    loaded = loader.load()
+                elif lower.endswith(".csv"):
+                    loader = CSVLoader(path, encoding="utf-8")
+                    loaded = loader.load()
+                else:
+                    continue
+
+                for d in loaded:
+                    d.metadata = d.metadata or {}
+                    d.metadata["source"] = d.metadata.get("source", path)
+                docs.extend(loaded)
+            except Exception:
+                continue
+    return docs
+
+
+def _split_docs(docs: List[Any]) -> List[Any]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1200,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", " ", ""],
+    )
+    return splitter.split_documents(docs)
+
+
+def _try_load_chroma():
+    """
+    Lazy import to avoid crashing Streamlit Cloud at module import time.
+    """
+    try:
+        from langchain_chroma import Chroma
+
+        if os.path.isdir(CHROMA_DIR):
+            embeddings = _get_embeddings()
+            return Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings), "chroma"
+    except Exception:
+        pass
+    return None, None
+
+
+def _try_load_faiss():
+    try:
+        if os.path.isdir(FAISS_DIR):
+            embeddings = _get_embeddings()
+            vs = FAISS.load_local(
+                FAISS_DIR,
+                embeddings,
+                allow_dangerous_deserialization=True,
+            )
+            return vs, "faiss"
+    except Exception:
+        pass
+    return None, None
+
+
+def _build_faiss_from_docs_dir():
+    docs = _load_docs_from_dir(DOCS_DIR)
+    if not docs:
+        return None, None
+
+    split_docs = _split_docs(docs)
+    embeddings = _get_embeddings()
+    vs = FAISS.from_documents(split_docs, embeddings)
+
+    try:
+        os.makedirs(FAISS_DIR, exist_ok=True)
+        vs.save_local(FAISS_DIR)
+    except Exception:
+        pass
+
+    return vs, "faiss-built"
+
+
+def rebuild_faiss_index() -> Tuple[bool, str]:
+    try:
+        docs = _load_docs_from_dir(DOCS_DIR)
+        if not docs:
+            return False, f"No source documents found in {DOCS_DIR}"
+
+        split_docs = _split_docs(docs)
+        embeddings = _get_embeddings()
+        vs = FAISS.from_documents(split_docs, embeddings)
+        os.makedirs(FAISS_DIR, exist_ok=True)
+        vs.save_local(FAISS_DIR)
+        load_vectorstore.cache_clear()
+        return True, f"FAISS index rebuilt from {len(split_docs)} chunks."
+    except Exception as e:
+        return False, f"FAISS rebuild failed: {e}"
+
+
+@lru_cache(maxsize=1)
+def load_vectorstore():
+    vs, backend = _try_load_chroma()
+    if vs is not None:
+        return vs, backend
+
+    vs, backend = _try_load_faiss()
+    if vs is not None:
+        return vs, backend
+
+    vs, backend = _build_faiss_from_docs_dir()
+    if vs is not None:
+        return vs, backend
+
+    return None, "none"
+
+
+# ============================================================
 # Retrieval and routing
 # ============================================================
 def _format_context_with_ids(docs: List[Any]) -> str:
@@ -224,7 +364,7 @@ def _format_context_with_ids(docs: List[Any]) -> str:
 
 
 def _retrieve_with_scores(query: str, k: int, fetch_k: int, lambda_mult: float) -> Tuple[List[Any], Optional[List[float]], Optional[float]]:
-    vectorstore = load_vectorstore()
+    vectorstore, _backend = load_vectorstore()
     if vectorstore is None:
         return [], None, None
 
@@ -240,13 +380,16 @@ def _retrieve_with_scores(query: str, k: int, fetch_k: int, lambda_mult: float) 
     except Exception:
         pass
 
-    # MMR for final context selection
     try:
-        docs = vectorstore.max_marginal_relevance_search(clean_query, k=k, fetch_k=fetch_k, lambda_mult=lambda_mult)
+        docs = vectorstore.max_marginal_relevance_search(
+            clean_query,
+            k=k,
+            fetch_k=fetch_k,
+            lambda_mult=lambda_mult,
+        )
     except Exception:
         docs = vectorstore.similarity_search(clean_query, k=k)
 
-    # sanitize + filter
     filtered_docs = []
     for d in docs:
         text = sanitize_text(getattr(d, "page_content", "") or "", GUARDRAILS.max_context_chars)
@@ -270,15 +413,36 @@ def route_query(query: str, k: int, fetch_k: int, lambda_mult: float, score_thre
 
     docs, scores, top_score = _retrieve_with_scores(query, k=k, fetch_k=fetch_k, lambda_mult=lambda_mult)
     if docs and top_score is not None and top_score >= score_threshold:
-        return {"route": "RAG", "reason": f"Top relevance score {top_score:.3f} >= {score_threshold:.2f}", "docs": docs, "scores": scores, "top_score": top_score}
+        return {
+            "route": "RAG",
+            "reason": f"Top relevance score {top_score:.3f} >= {score_threshold:.2f}",
+            "docs": docs,
+            "scores": scores,
+            "top_score": top_score,
+        }
 
-    # semantic/operational trigger fallback: if query looks protocol-specific and docs exist, still use RAG
     trigger_terms = [
-        "sample size", "surveillance", "processing fluids", "oral fluids", "elimination",
-        "stability", "protocol", "monitoring", "sampling", "herd", "prevalence", "pooling"
+        "sample size",
+        "surveillance",
+        "processing fluids",
+        "oral fluids",
+        "elimination",
+        "stability",
+        "protocol",
+        "monitoring",
+        "sampling",
+        "herd",
+        "prevalence",
+        "pooling",
     ]
     if docs and any(t in query.lower() for t in trigger_terms):
-        return {"route": "RAG", "reason": "Protocol-specific query with retrievable context", "docs": docs, "scores": scores, "top_score": top_score}
+        return {
+            "route": "RAG",
+            "reason": "Protocol-specific query with retrievable context",
+            "docs": docs,
+            "scores": scores,
+            "top_score": top_score,
+        }
 
     return {"route": "BASE", "reason": "Weak retrieval signal or no vector store", "docs": docs, "scores": scores, "top_score": top_score}
 
@@ -286,7 +450,12 @@ def route_query(query: str, k: int, fetch_k: int, lambda_mult: float, score_thre
 # ============================================================
 # Generation
 # ============================================================
-def generate_base_response(user_input: str, max_completion_tokens: int = 500, temperature: float = 0.2, top_p: float = 0.95) -> str:
+def generate_base_response(
+    user_input: str,
+    max_completion_tokens: int = 500,
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+) -> str:
     resp = safe_chat_completion(
         model=MODEL_NAME,
         messages=[
@@ -300,7 +469,13 @@ def generate_base_response(user_input: str, max_completion_tokens: int = 500, te
     return resp.choices[0].message.content.strip()
 
 
-def generate_rag_response(user_input: str, docs: List[Any], max_completion_tokens: int = 700, temperature: float = 0.2, top_p: float = 0.95) -> str:
+def generate_rag_response(
+    user_input: str,
+    docs: List[Any],
+    max_completion_tokens: int = 700,
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+) -> str:
     if not docs:
         return 'Not found in the provided context. General knowledge (not from context): No retrieved context was available.'
 
@@ -320,20 +495,52 @@ def generate_rag_response(user_input: str, docs: List[Any], max_completion_token
     return resp.choices[0].message.content.strip()
 
 
-def answer_query(user_input: str, mode: str, k: int, fetch_k: int, lambda_mult: float, score_threshold: float, max_completion_tokens: int) -> Dict[str, Any]:
+def answer_query(
+    user_input: str,
+    mode: str,
+    k: int,
+    fetch_k: int,
+    lambda_mult: float,
+    score_threshold: float,
+    max_completion_tokens: int,
+) -> Dict[str, Any]:
     route_info = {"route": mode, "reason": "User selected mode", "docs": [], "scores": None, "top_score": None}
 
     if mode == "AUTO":
-        route_info = route_query(user_input, k=k, fetch_k=fetch_k, lambda_mult=lambda_mult, score_threshold=score_threshold)
+        route_info = route_query(
+            user_input,
+            k=k,
+            fetch_k=fetch_k,
+            lambda_mult=lambda_mult,
+            score_threshold=score_threshold,
+        )
         mode = route_info["route"]
     elif mode == "RAG":
-        docs, scores, top_score = _retrieve_with_scores(user_input, k=k, fetch_k=fetch_k, lambda_mult=lambda_mult)
-        route_info = {"route": "RAG", "reason": "User selected RAG", "docs": docs, "scores": scores, "top_score": top_score}
+        docs, scores, top_score = _retrieve_with_scores(
+            user_input,
+            k=k,
+            fetch_k=fetch_k,
+            lambda_mult=lambda_mult,
+        )
+        route_info = {
+            "route": "RAG",
+            "reason": "User selected RAG",
+            "docs": docs,
+            "scores": scores,
+            "top_score": top_score,
+        }
 
     if mode == "RAG":
-        answer = generate_rag_response(user_input, docs=route_info["docs"], max_completion_tokens=max_completion_tokens)
+        answer = generate_rag_response(
+            user_input,
+            docs=route_info["docs"],
+            max_completion_tokens=max_completion_tokens,
+        )
     else:
-        answer = generate_base_response(user_input, max_completion_tokens=max_completion_tokens)
+        answer = generate_base_response(
+            user_input,
+            max_completion_tokens=max_completion_tokens,
+        )
 
     return {**route_info, "answer": answer}
 
@@ -351,8 +558,27 @@ with st.sidebar:
     max_completion_tokens = st.slider("Max completion tokens", 200, 1200, 600, 50)
     show_debug = st.checkbox("Show routing + retrieved chunks", value=True)
 
-vectorstore_ready = load_vectorstore() is not None
-st.info(f"Vector store: {'loaded' if vectorstore_ready else 'not found'} | Mode: {mode} | Model: {MODEL_NAME}")
+    st.divider()
+    st.subheader("Vector store status")
+    _vs, backend_name = load_vectorstore()
+    st.write(f"Backend: **{backend_name}**")
+    st.write(f"Chroma dir: `{CHROMA_DIR}`")
+    st.write(f"FAISS dir: `{FAISS_DIR}`")
+    st.write(f"Docs dir: `{DOCS_DIR}`")
+
+    if st.button("Rebuild FAISS from docs/"):
+        ok, msg = rebuild_faiss_index()
+        if ok:
+            st.success(msg)
+        else:
+            st.error(msg)
+
+vectorstore_obj, backend_name = load_vectorstore()
+vectorstore_ready = vectorstore_obj is not None
+st.info(
+    f"Vector store: {'loaded' if vectorstore_ready else 'not found'} | "
+    f"Backend: {backend_name} | Mode: {mode} | Model: {MODEL_NAME}"
+)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
