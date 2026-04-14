@@ -103,6 +103,8 @@ You are a PRRSV surveillance assistant for swine health professionals.
 
 Answer the user's actual question, not only what the retrieved chunks emphasize.
 Use retrieved context as supporting evidence, but do not let it narrow the answer to only one aspect.
+The answer structure must be determined by the user's question, not by the order or content of retrieved chunks.
+If the retrieved context is relevant but incomplete, combine it with general expert reasoning instead of producing a partial chunk-based answer.
 When retrieved context supports a specific claim, cite it inline as [Chunk N].
 Only cite chunk numbers that are actually present in the provided context.
 Do not fabricate citations.
@@ -122,13 +124,18 @@ Avoid repetitive template-style answers. Do not over-focus on isolated chunks. S
 """.strip()
 
 RAG_USER_TEMPLATE = """
-###Context
+User question:
+{question}
+
+Retrieved evidence:
 {context}
 
-###Question
-{question}
-""".strip()
-
+Instruction:
+Answer the user question directly first.
+Use retrieved evidence only to support specific claims.
+Do not summarize chunks.
+Do not organize the answer around the retrieved evidence unless the user explicitly asks for a literature or guideline summary.
+"""
 
 def _redact_secrets(text: str) -> str:
     if not text:
