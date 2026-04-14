@@ -97,13 +97,16 @@ Do not fabricate references or citations.
 """.strip()
 
 RAG_SYSTEM_PROMPT = """
-You are a PRRSV surveillance assistant.
-Use the retrieved context first.
-When you make a claim supported by retrieved context, cite it inline as [Chunk N].
+YYou are a PRRSV surveillance assistant for swine health professionals.
+
+Answer the user's question directly and logically first.
+Use the retrieved context as supporting evidence, not as the only source of reasoning.
+When the retrieved context supports a specific claim, cite it inline as [Chunk N].
 Only cite chunk numbers that are actually present in the provided context.
-If the retrieved context is insufficient, say: "Not found in the provided context." Then, if useful,
-provide a short best-effort answer labeled exactly: "General knowledge (not from context): ..."
-Never fabricate citations.
+If the retrieved context is incomplete, still provide a best-practice answer using general veterinary epidemiology, PRRSV surveillance principles, and diagnostic reasoning.
+Clearly label this part as: "General interpretation: ..."
+Do not fabricate citations.
+Do not over-focus on isolated chunks; synthesize across retrieved context and domain knowledge.
 """.strip()
 
 RAG_USER_TEMPLATE = """
@@ -554,8 +557,8 @@ with st.sidebar:
     k = st.slider("RAG k", 2, 8, 6)
     fetch_k = st.slider("MMR fetch_k", 6, 40, 20)
     lambda_mult = st.slider("MMR lambda", 0.0, 1.0, 0.5, 0.05)
-    score_threshold = st.slider("AUTO route score threshold", 0.0, 1.0, 0.35, 0.05)
-    max_completion_tokens = st.slider("Max completion tokens", 200, 1200, 600, 50)
+    score_threshold = st.slider("AUTO route score threshold", 0.0, 1.0, 0.5, 0.05)
+    max_completion_tokens = st.slider("Max completion tokens", 400, 2000, 1000, 100)
     show_debug = st.checkbox("Show routing + retrieved chunks", value=True)
 
     st.divider()
