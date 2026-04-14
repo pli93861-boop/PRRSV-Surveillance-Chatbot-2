@@ -89,6 +89,26 @@ ANTI_INJECTION_SYSTEM_BANNER = (
 )
 
 
+HYBRID_SYSTEM_PROMPT = """
+You are a PRRSV surveillance expert assistant.
+
+Answer the question using expert reasoning first.
+Use retrieved evidence only to support or qualify specific claims.
+
+Do not summarize chunks.
+Do not organize the answer according to retrieved chunks.
+Do not let retrieved evidence replace your own logical structure.
+
+First provide the practical answer.
+Then add citations only where retrieved evidence directly supports a statement.
+
+If the retrieved evidence is incomplete, do not force the answer to fit it.
+Use general expert reasoning and clearly label it as:
+"General expert interpretation: ..."
+
+Only cite chunks that are actually provided.
+"""
+
 BASE_SYSTEM_PROMPT = """
 You are a PRRSV surveillance assistant for swine health professionals.
 Answer clearly, logically, and practically.
@@ -123,18 +143,16 @@ If retrieved context is incomplete, still answer using best-practice reasoning a
 Avoid repetitive template-style answers. Do not over-focus on isolated chunks. Synthesize across retrieved context, user constraints, and domain knowledge.
 """.strip()
 
-RAG_USER_TEMPLATE = """
+HYBRID_USER_TEMPLATE = """
 User question:
 {question}
 
-Retrieved evidence:
+Retrieved evidence for support:
 {context}
 
 Instruction:
-Answer the user question directly first.
-Use retrieved evidence only to support specific claims.
-Do not summarize chunks.
-Do not organize the answer around the retrieved evidence unless the user explicitly asks for a literature or guideline summary.
+Answer the user question directly using expert logic first.
+Use the retrieved evidence only as supporting material.
 """
 
 def _redact_secrets(text: str) -> str:
@@ -433,18 +451,23 @@ def route_query(query: str, k: int, fetch_k: int, lambda_mult: float, score_thre
         return {"route": "BASE", "reason": "High prompt-injection risk", "docs": [], "scores": None, "top_score": None}
 
     docs, scores, top_score = _retrieve_with_scores(query, k=k, fetch_k=fetch_k, lambda_mult=lambda_mult)
-    if docs and top_score is not None and top_score >= score_threshold:
-        return {
-            "route": "RAG",
-            "reason": f"Top relevance score {top_score:.3f} >= {score_threshold:.2f}",
-            "docs": docs,
-            "scores": scores,
-            "top_score": top_score,
-        }
 
+if docs and top_score is not None and top_score >= score_threshold:
+    return {
+        "route": "HYBRID",
+        "reason": f"Evidence available; using hybrid reasoning with top score {top_score:.3f}",
+        "docs": docs,
+        "scores": scores,
+        "top_score": top_score,
+    }
 
-    return {"route": "BASE", "reason": "Weak retrieval signal or no vector store", "docs": docs, "scores": scores, "top_score": top_score}
-
+return {
+    "route": "BASE",
+    "reason": "Weak retrieval signal or no vector store",
+    "docs": docs,
+    "scores": scores,
+    "top_score": top_score,
+}
 
 # ============================================================
 # Generation
