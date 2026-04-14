@@ -91,23 +91,34 @@ ANTI_INJECTION_SYSTEM_BANNER = (
 
 BASE_SYSTEM_PROMPT = """
 You are a PRRSV surveillance assistant for swine health professionals.
-Answer clearly, concisely, and cautiously.
-If a question depends on herd-specific context, say what additional context would change the answer.
+Answer clearly, logically, and practically.
+Adapt the response structure to the user's task type: concept explanation, comparison, planning/protocol, calculation/budget, evidence summary, or writing refinement.
+If the user provides constraints such as budget, number of PCR tests, herd size, sample type, prevalence, or stability goal, use them explicitly.
+If a question depends on missing herd-specific context, state what information would change the answer, but still provide a useful default recommendation when reasonable.
 Do not fabricate references or citations.
 """.strip()
 
 RAG_SYSTEM_PROMPT = """
-YYou are a PRRSV surveillance assistant for swine health professionals.
+You are a PRRSV surveillance assistant for swine health professionals.
 
-Answer the user's question directly and logically first.
-Use the retrieved context as supporting evidence, not as the only source of reasoning.
-When the retrieved context supports a specific claim, cite it inline as [Chunk N].
+Answer the user's actual question, not only what the retrieved chunks emphasize.
+Use retrieved context as supporting evidence, but do not let it narrow the answer to only one aspect.
+When retrieved context supports a specific claim, cite it inline as [Chunk N].
 Only cite chunk numbers that are actually present in the provided context.
-If the retrieved context is incomplete, still provide a best-practice answer using general veterinary epidemiology, PRRSV surveillance principles, and diagnostic reasoning.
-Clearly label this part as: "General interpretation: ..."
 Do not fabricate citations.
-Avoid repetitive template-style answers. Adapt the structure, examples, and recommendations to the user's exact question
-Do not over-focus on isolated chunks; synthesize across retrieved context and domain knowledge.
+
+Adapt the answer to the user's task type:
+1. Concept explanation: define key terms and give a practical swine-health example.
+2. Comparison question: compare options using relevant criteria such as sensitivity, timing, cost, feasibility, sample type, and decision use.
+3. Planning/protocol question: provide objective, sample type, testing schedule, number of PCR tests, pooling strategy if applicable, interpretation, and escalation rule.
+4. Calculation/budget question: use the user's numbers explicitly, show the calculation briefly, and convert it into a practical recommendation.
+5. Evidence/guideline question: prioritize retrieved context and cite supporting chunks.
+6. Writing/refinement question: improve clarity, logic, tone, and structure without overloading citations.
+
+If retrieved context is incomplete, still answer using best-practice reasoning and clearly label that part as:
+"General interpretation: ..."
+
+Avoid repetitive template-style answers. Do not over-focus on isolated chunks. Synthesize across retrieved context, user constraints, and domain knowledge.
 """.strip()
 
 RAG_USER_TEMPLATE = """
@@ -346,10 +357,9 @@ def load_vectorstore():
     if vs is not None:
         return vs, backend
 
-    vs, backend = _build_faiss_from_docs_dir()
-    if vs is not None:
-        return vs, backend
-
+    # Do not automatically build FAISS on Streamlit Cloud startup.
+    # Build the FAISS index locally or with the manual sidebar button,
+    # then deploy the saved faiss_index/ folder.
     return None, "none"
 
 
@@ -426,15 +436,6 @@ def route_query(query: str, k: int, fetch_k: int, lambda_mult: float, score_thre
         }
 
 
-    if docs and any(t in query.lower() for t in trigger_terms):
-        return {
-            "route": "RAG",
-            "reason": "Protocol-specific query with retrievable context",
-            "docs": docs,
-            "scores": scores,
-            "top_score": top_score,
-        }
-
     return {"route": "BASE", "reason": "Weak retrieval signal or no vector store", "docs": docs, "scores": scores, "top_score": top_score}
 
 
@@ -444,7 +445,7 @@ def route_query(query: str, k: int, fetch_k: int, lambda_mult: float, score_thre
 def generate_base_response(
     user_input: str,
     max_completion_tokens: int = 500,
-    temperature: float = 0.2,
+    temperature: float = 0.45,
     top_p: float = 0.95,
 ) -> str:
     resp = safe_chat_completion(
@@ -464,8 +465,8 @@ def generate_rag_response(
     user_input: str,
     docs: List[Any],
     max_completion_tokens: int = 700,
-    temperature: float = 0.2,
-    top_p: float = 0.95,
+    temperature: float = 0.25,
+    top_p: float = 0.90,
 ) -> str:
     if not docs:
         return 'Not found in the provided context. General knowledge (not from context): No retrieved context was available.'
@@ -545,7 +546,7 @@ with st.sidebar:
     k = st.slider("RAG k", 2, 8, 6)
     fetch_k = st.slider("MMR fetch_k", 6, 40, 20)
     lambda_mult = st.slider("MMR lambda", 0.0, 1.0, 0.5, 0.05)
-    score_threshold = st.slider("AUTO route score threshold", 0.0, 1.0, 0.5, 0.05)
+    score_threshold = st.slider("AUTO route score threshold", 0.0, 1.0, 0.50, 0.05)
     max_completion_tokens = st.slider("Max completion tokens", 400, 2000, 1000, 100)
     show_debug = st.checkbox("Show routing + retrieved chunks", value=True)
 
