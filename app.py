@@ -443,7 +443,7 @@ def route_query(query: str, k: int, fetch_k: int, lambda_mult: float, score_thre
     """
     AUTO routing logic:
     1) hard-fail to BASE if prompt injection risk is high
-    2) prefer RAG when retrieval has adequate signal
+    2) prefer HYBRID when retrieval has adequate signal
     3) otherwise fall back to BASE
     """
     injection = detect_injection_and_risk(query)
@@ -452,22 +452,22 @@ def route_query(query: str, k: int, fetch_k: int, lambda_mult: float, score_thre
 
     docs, scores, top_score = _retrieve_with_scores(query, k=k, fetch_k=fetch_k, lambda_mult=lambda_mult)
 
-if docs and top_score is not None and top_score >= score_threshold:
+    if docs and top_score is not None and top_score >= score_threshold:
+        return {
+            "route": "HYBRID",
+            "reason": f"Evidence available; using hybrid reasoning with top score {top_score:.3f}",
+            "docs": docs,
+            "scores": scores,
+            "top_score": top_score,
+        }
+
     return {
-        "route": "HYBRID",
-        "reason": f"Evidence available; using hybrid reasoning with top score {top_score:.3f}",
+        "route": "BASE",
+        "reason": "Weak retrieval signal or no vector store",
         "docs": docs,
         "scores": scores,
         "top_score": top_score,
     }
-
-return {
-    "route": "BASE",
-    "reason": "Weak retrieval signal or no vector store",
-    "docs": docs,
-    "scores": scores,
-    "top_score": top_score,
-}
 
 # ============================================================
 # Generation
