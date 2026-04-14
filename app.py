@@ -584,23 +584,23 @@ def answer_query(
             "top_score": top_score,
         }
 
-    if mode == "RAG":
-    answer = generate_rag_response(
-        user_input,
-        docs=route_info["docs"],
-        max_completion_tokens=max_completion_tokens,
-    )
-elif mode == "HYBRID":
-    answer = generate_hybrid_response(
-        user_input,
-        docs=route_info["docs"],
-        max_completion_tokens=max_completion_tokens,
-    )
-else:
-    answer = generate_base_response(
-        user_input,
-        max_completion_tokens=max_completion_tokens,
-    )
+   　    if mode == "RAG":
+        answer = generate_rag_response(
+            user_input,
+            docs=route_info["docs"],
+            max_completion_tokens=max_completion_tokens,
+        )
+    elif mode == "HYBRID":
+        answer = generate_hybrid_response(
+            user_input,
+            docs=route_info["docs"],
+            max_completion_tokens=max_completion_tokens,
+        )
+    else:
+        answer = generate_base_response(
+            user_input,
+            max_completion_tokens=max_completion_tokens,
+        )
 
     return {**route_info, "answer": answer}
 
