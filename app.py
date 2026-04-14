@@ -92,21 +92,23 @@ ANTI_INJECTION_SYSTEM_BANNER = (
 HYBRID_SYSTEM_PROMPT = """
 You are a PRRSV surveillance expert assistant.
 
-Answer the question using expert reasoning first.
-Use retrieved evidence only to support or qualify specific claims.
+Answer the user's question using expert reasoning first.
+Use retrieved evidence as supporting material.
 
-Do not summarize chunks.
-Do not organize the answer according to retrieved chunks.
-Do not let retrieved evidence replace your own logical structure.
+Important citation rule:
+When retrieved evidence supports a specific claim, cite it inline as [Chunk N].
+You must include [Chunk N] citations when using retrieved evidence.
+Only cite chunk numbers that are actually provided.
+Do not fabricate citations.
 
-First provide the practical answer.
-Then add citations only where retrieved evidence directly supports a statement.
+Do not simply summarize chunks.
+Do not organize the answer around retrieved chunks.
+The answer structure should follow the user's question and practical decision needs.
 
-If the retrieved evidence is incomplete, do not force the answer to fit it.
-Use general expert reasoning and clearly label it as:
+If retrieved evidence is incomplete, combine it with general expert reasoning and clearly label that part as:
 "General expert interpretation: ..."
 
-Only cite chunks that are actually provided.
+Never fabricate references or citations.
 """
 
 BASE_SYSTEM_PROMPT = """
@@ -147,12 +149,13 @@ HYBRID_USER_TEMPLATE = """
 User question:
 {question}
 
-Retrieved evidence for support:
+Retrieved evidence:
 {context}
 
 Instruction:
 Answer the user question directly using expert logic first.
-Use the retrieved evidence only as supporting material.
+Use retrieved evidence to support specific claims with inline [Chunk N] citations.
+At least one [Chunk N] citation should be included if the retrieved evidence is relevant.
 """
 
 def _redact_secrets(text: str) -> str:
@@ -516,6 +519,35 @@ def generate_rag_response(
     )
     return resp.choices[0].message.content.strip()
 
+def generate_hybrid_response(
+    user_input: str,
+    docs: List[Any],
+    max_completion_tokens: int = 1000,
+    temperature: float = 0.3,
+    top_p: float = 0.9,
+) -> str:
+    if not docs:
+        return generate_base_response(
+            user_input,
+            max_completion_tokens=max_completion_tokens,
+            temperature=0.45,
+            top_p=0.95,
+        )
+
+    context = _format_context_with_ids(docs)
+    user_message = HYBRID_USER_TEMPLATE.format(context=context, question=user_input)
+
+    resp = safe_chat_completion(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": HYBRID_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        max_completion_tokens=max_completion_tokens,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    return resp.choices[0].message.content.strip()
 
 def answer_query(
     user_input: str,
@@ -553,16 +585,22 @@ def answer_query(
         }
 
     if mode == "RAG":
-        answer = generate_rag_response(
-            user_input,
-            docs=route_info["docs"],
-            max_completion_tokens=max_completion_tokens,
-        )
-    else:
-        answer = generate_base_response(
-            user_input,
-            max_completion_tokens=max_completion_tokens,
-        )
+    answer = generate_rag_response(
+        user_input,
+        docs=route_info["docs"],
+        max_completion_tokens=max_completion_tokens,
+    )
+elif mode == "HYBRID":
+    answer = generate_hybrid_response(
+        user_input,
+        docs=route_info["docs"],
+        max_completion_tokens=max_completion_tokens,
+    )
+else:
+    answer = generate_base_response(
+        user_input,
+        max_completion_tokens=max_completion_tokens,
+    )
 
     return {**route_info, "answer": answer}
 
@@ -572,7 +610,7 @@ def answer_query(
 # ============================================================
 with st.sidebar:
     st.subheader("Runtime controls")
-    mode = st.selectbox("Mode", ["AUTO", "RAG", "BASE"], index=0)
+    mode = st.selectbox("Mode", ["AUTO", "HYBRID", "RAG", "BASE"], index=0)
     k = st.slider("RAG k", 2, 8, 6)
     fetch_k = st.slider("MMR fetch_k", 6, 40, 20)
     lambda_mult = st.slider("MMR lambda", 0.0, 1.0, 0.5, 0.05)
