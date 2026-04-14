@@ -106,6 +106,7 @@ Only cite chunk numbers that are actually present in the provided context.
 If the retrieved context is incomplete, still provide a best-practice answer using general veterinary epidemiology, PRRSV surveillance principles, and diagnostic reasoning.
 Clearly label this part as: "General interpretation: ..."
 Do not fabricate citations.
+Avoid repetitive template-style answers. Adapt the structure, examples, and recommendations to the user's exact question
 Do not over-focus on isolated chunks; synthesize across retrieved context and domain knowledge.
 """.strip()
 
@@ -424,20 +425,7 @@ def route_query(query: str, k: int, fetch_k: int, lambda_mult: float, score_thre
             "top_score": top_score,
         }
 
-    trigger_terms = [
-        "sample size",
-        "surveillance",
-        "processing fluids",
-        "oral fluids",
-        "elimination",
-        "stability",
-        "protocol",
-        "monitoring",
-        "sampling",
-        "herd",
-        "prevalence",
-        "pooling",
-    ]
+
     if docs and any(t in query.lower() for t in trigger_terms):
         return {
             "route": "RAG",
