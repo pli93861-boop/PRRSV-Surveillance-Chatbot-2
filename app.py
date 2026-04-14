@@ -584,7 +584,7 @@ def answer_query(
             "top_score": top_score,
         }
 
-   if mode == "RAG":
+   　if mode == "RAG":
         answer = generate_rag_response(
             user_input,
             docs=route_info["docs"],
