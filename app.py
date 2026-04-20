@@ -8,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from difflib import SequenceMatcher
-from datetime import datetime
+from datetime import datetime, date
 
 import streamlit as st
 from openai import OpenAI
@@ -71,10 +71,26 @@ def _load_json_list(path: Path) -> List[Dict[str, Any]]:
 
 
 
+def _json_safe(obj: Any):
+    """Convert common non-JSON-serializable objects into safe values."""
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if hasattr(obj, "item"):
+        try:
+            return obj.item()
+        except Exception:
+            pass
+    if isinstance(obj, set):
+        return list(obj)
+    return str(obj)
+
+
 def _save_json_list(path: Path, data: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2, default=_json_safe)
 
 
 
@@ -585,15 +601,15 @@ def log_chat_round(
         "question": user_input,
         "route": result.get("route"),
         "reason": result.get("reason"),
-        "top_score": result.get("top_score"),
+        "top_score": float(result.get("top_score")) if result.get("top_score") is not None else None,
         "approved_correction_id": correction.correction_id if correction else None,
         "approved_correction_question": correction.canonical_question if correction else None,
         "retrieved_chunks": [
             {
-                "chunk_no": i,
-                "source": getattr(d, "metadata", {}).get("source", "unknown"),
-                "page": getattr(d, "metadata", {}).get("page", getattr(d, "metadata", {}).get("page_number", "NA")),
-                "text": getattr(d, "page_content", "") or "",
+                "chunk_no": int(i),
+                "source": str(getattr(d, "metadata", {}).get("source", "unknown")),
+                "page": str(getattr(d, "metadata", {}).get("page", getattr(d, "metadata", {}).get("page_number", "NA"))),
+                "text": str(getattr(d, "page_content", "") or ""),
             }
             for i, d in enumerate(docs, start=1)
         ],
@@ -1220,7 +1236,7 @@ if user_input:
                 debug_payload = {
                     "route": result["route"],
                     "reason": result["reason"],
-                    "top_score": result.get("top_score"),
+                    "top_score": float(result.get("top_score")) if result.get("top_score") is not None else None,
                     "n_docs": len(result.get("docs") or []),
                 }
                 with st.expander("Routing details", expanded=False):
