@@ -2,6 +2,8 @@ import os
 import re
 import time
 import json
+import csv
+import io
 import uuid
 from dataclasses import dataclass, asdict
 from functools import lru_cache
@@ -98,6 +100,68 @@ def _append_json_item(path: Path, item: Dict[str, Any]) -> None:
     data = _load_json_list(path)
     data.append(item)
     _save_json_list(path, data)
+
+
+def check_admin_password() -> bool:
+    """Return True only when ADMIN_PASSWORD is set and the entered sidebar password matches it."""
+    if not ADMIN_PASSWORD:
+        return False
+    return st.session_state.get("admin_pwd", "") == ADMIN_PASSWORD
+
+
+def export_logs_to_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
+    """Export chat logs to a flat CSV for administrator download."""
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "log_id",
+        "created_at",
+        "user_email",
+        "user_id",
+        "is_authorized",
+        "question",
+        "route",
+        "reason",
+        "top_score",
+        "approved_correction_id",
+        "approved_correction_question",
+        "flags",
+        "retrieved_chunks",
+        "raw_answer",
+        "final_answer",
+    ])
+
+    for row in rows:
+        flags = " | ".join([str(x) for x in (row.get("flags") or [])])
+        retrieved_chunks = row.get("retrieved_chunks") or []
+        retrieved_chunks_text = " || ".join([
+            f"Chunk {ch.get('chunk_no', '')}; source={ch.get('source', '')}; page={ch.get('page', '')}; text={str(ch.get('text', ''))[:500]}"
+            for ch in retrieved_chunks
+        ])
+        writer.writerow([
+            row.get("log_id"),
+            row.get("created_at"),
+            row.get("user_email"),
+            row.get("user_id"),
+            row.get("is_authorized"),
+            row.get("question"),
+            row.get("route"),
+            row.get("reason"),
+            row.get("top_score"),
+            row.get("approved_correction_id"),
+            row.get("approved_correction_question"),
+            flags,
+            retrieved_chunks_text,
+            row.get("raw_answer"),
+            row.get("final_answer"),
+        ])
+
+    return output.getvalue().encode("utf-8")
+
+
+def export_json_bytes(rows: List[Dict[str, Any]]) -> bytes:
+    """Export rows as JSON bytes for administrator download."""
+    return json.dumps(rows, ensure_ascii=False, indent=2, default=_json_safe).encode("utf-8")
 
 
 # ============================================================
@@ -1050,10 +1114,11 @@ def render_admin_panel() -> None:
         st.info("Set ADMIN_PASSWORD env var to enable approval actions.")
         return
 
-    pwd = st.text_input("Admin password", type="password", key="admin_pwd")
-    is_admin = pwd == ADMIN_PASSWORD
+    st.text_input("Admin password", type="password", key="admin_pwd")
+    is_admin = check_admin_password()
+
     if not is_admin:
-        st.caption("Enter admin password to review or approve corrections.")
+        st.caption("Enter admin password to review, approve, reject, or download logs.")
         return
 
     st.success("Admin mode enabled")
@@ -1066,18 +1131,63 @@ def render_admin_panel() -> None:
     st.write(f"Approved corrections: **{len(approved)}**")
     st.write(f"Chat logs: **{len(chat_logs)}**")
 
+    st.markdown("### Export data")
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        if chat_logs:
+            st.download_button(
+                label="Download chat_logs.json",
+                data=export_json_bytes(chat_logs),
+                file_name="chat_logs.json",
+                mime="application/json",
+                key="download_chat_logs_json",
+            )
+            st.download_button(
+                label="Download chat_logs.csv",
+                data=export_logs_to_csv_bytes(chat_logs),
+                file_name="chat_logs.csv",
+                mime="text/csv",
+                key="download_chat_logs_csv",
+            )
+        else:
+            st.caption("No chat logs available yet.")
+
+    with col_b:
+        if pending:
+            st.download_button(
+                label="Download pending_feedback.json",
+                data=export_json_bytes(pending),
+                file_name="pending_feedback.json",
+                mime="application/json",
+                key="download_pending_feedback_json",
+            )
+        if approved:
+            st.download_button(
+                label="Download approved_corrections.json",
+                data=export_json_bytes(approved),
+                file_name="approved_corrections.json",
+                mime="application/json",
+                key="download_approved_corrections_json",
+            )
+
     if chat_logs:
         with st.expander("Recent chat logs", expanded=False):
             for row in reversed(chat_logs[-10:]):
                 st.markdown(f"**{row.get('created_at')}** | {row.get('user_email') or 'anonymous'}")
                 st.write("Q:", row.get("question"))
                 st.write("Route:", row.get("route"), "| top_score:", row.get("top_score"))
+                st.write("Authorized:", row.get("is_authorized"))
                 st.write("Flags:", row.get("flags"))
+                if row.get("approved_correction_question"):
+                    st.write("Approved correction used:", row.get("approved_correction_question"))
                 if row.get("retrieved_chunks"):
                     st.write("Retrieved chunks:")
                     for ch in row["retrieved_chunks"][:3]:
                         st.code(ch.get("text", "")[:800], language=None)
                 st.divider()
+
+    st.markdown("### Review pending feedback")
 
     if not pending:
         st.caption("No pending feedback.")
@@ -1086,7 +1196,10 @@ def render_admin_panel() -> None:
     selected_id = st.selectbox(
         "Pending feedback items",
         options=[x["feedback_id"] for x in pending],
-        format_func=lambda fid: next((f"{x['feedback_id']} | {x.get('question', '')[:80]}" for x in pending if x["feedback_id"] == fid), fid),
+        format_func=lambda fid: next(
+            (f"{x['feedback_id']} | {x.get('question', '')[:80]}" for x in pending if x["feedback_id"] == fid),
+            fid
+        ),
     )
     item = next(x for x in pending if x["feedback_id"] == selected_id)
     st.json(item)
@@ -1109,7 +1222,7 @@ def render_admin_panel() -> None:
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Approve correction"):
+        if st.button("Approve correction", key="approve_correction_btn"):
             correction = approve_feedback_to_correction(
                 feedback_id=selected_id,
                 canonical_question=canonical_question,
@@ -1127,8 +1240,9 @@ def render_admin_panel() -> None:
             )
             st.success(f"Approved correction: {correction.correction_id}")
             st.rerun()
+
     with col2:
-        if st.button("Reject feedback"):
+        if st.button("Reject feedback", key="reject_feedback_btn"):
             update_feedback_status(selected_id, "rejected")
             st.warning("Feedback rejected")
             st.rerun()
