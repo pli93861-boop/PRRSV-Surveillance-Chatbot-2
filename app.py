@@ -2,6 +2,8 @@ import os
 import re
 import time
 import json
+import csv
+import io
 import uuid
 from dataclasses import dataclass, asdict, field
 from functools import lru_cache
@@ -98,6 +100,106 @@ def _append_json_item(path: Path, item: Dict[str, Any]) -> None:
     data = _load_json_list(path)
     data.append(item)
     _save_json_list(path, data)
+
+
+def export_json_bytes(rows: List[Dict[str, Any]]) -> bytes:
+    return json.dumps(rows, ensure_ascii=False, indent=2, default=_json_safe).encode("utf-8")
+
+
+def export_logs_to_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "log_id", "created_at", "user_email", "user_id", "is_authorized",
+        "question", "route", "reason", "top_score",
+        "approved_correction_id", "approved_correction_question",
+        "approved_correction_type", "approved_correction_strength",
+        "flags", "retrieved_chunks", "raw_answer", "final_answer"
+    ])
+    for row in rows:
+        flags = " | ".join([str(x) for x in (row.get("flags") or [])])
+        retrieved_chunks = row.get("retrieved_chunks") or []
+        retrieved_chunks_text = " || ".join([
+            f"Chunk {ch.get('chunk_no', '')}; source={ch.get('source', '')}; page={ch.get('page', '')}; text={str(ch.get('text', ''))[:500]}"
+            for ch in retrieved_chunks
+        ])
+        writer.writerow([
+            row.get("log_id"), row.get("created_at"), row.get("user_email"), row.get("user_id"), row.get("is_authorized"),
+            row.get("question"), row.get("route"), row.get("reason"), row.get("top_score"),
+            row.get("approved_correction_id"), row.get("approved_correction_question"),
+            row.get("approved_correction_type"), row.get("approved_correction_strength"),
+            flags, retrieved_chunks_text, row.get("raw_answer"), row.get("final_answer")
+        ])
+    return output.getvalue().encode("utf-8")
+
+
+def update_approved_correction(
+    correction_id: str,
+    *,
+    canonical_question: str,
+    corrected_answer: str,
+    topic: str,
+    population: str,
+    source: str,
+    source_type: str,
+    confidence_tier: str,
+    correction_type: str,
+    strength: str,
+    aliases: Optional[List[str]] = None,
+    must_include: Optional[List[str]] = None,
+    must_not_say: Optional[List[str]] = None,
+    notes: str = "",
+    updated_by: str = "admin_panel",
+) -> bool:
+    rows = _load_json_list(APPROVED_CORRECTIONS_FILE)
+    updated = False
+    for row in rows:
+        if row.get("correction_id") == correction_id:
+            row["canonical_question"] = canonical_question
+            row["corrected_answer"] = corrected_answer
+            row["topic"] = topic
+            row["population"] = population
+            row["source"] = source
+            row["source_type"] = source_type
+            row["confidence_tier"] = confidence_tier
+            row["correction_type"] = correction_type
+            row["strength"] = strength
+            row["aliases"] = aliases or []
+            row["must_include"] = must_include or []
+            row["must_not_say"] = must_not_say or []
+            row["notes"] = notes
+            row["updated_at"] = datetime.utcnow().isoformat()
+            row["updated_by"] = updated_by
+            row["is_active"] = row.get("is_active", True)
+            updated = True
+            break
+    if updated:
+        _save_json_list(APPROVED_CORRECTIONS_FILE, rows)
+    return updated
+
+
+def set_approved_correction_active(correction_id: str, is_active: bool, updated_by: str = "admin_panel") -> bool:
+    rows = _load_json_list(APPROVED_CORRECTIONS_FILE)
+    updated = False
+    for row in rows:
+        if row.get("correction_id") == correction_id:
+            row["is_active"] = is_active
+            row["updated_at"] = datetime.utcnow().isoformat()
+            row["updated_by"] = updated_by
+            updated = True
+            break
+    if updated:
+        _save_json_list(APPROVED_CORRECTIONS_FILE, rows)
+    return updated
+
+
+def delete_approved_correction(correction_id: str) -> bool:
+    rows = _load_json_list(APPROVED_CORRECTIONS_FILE)
+    new_rows = [row for row in rows if row.get("correction_id") != correction_id]
+    changed = len(new_rows) != len(rows)
+    if changed:
+        _save_json_list(APPROVED_CORRECTIONS_FILE, new_rows)
+    return changed
 
 
 # ============================================================
@@ -1112,7 +1214,7 @@ def render_admin_panel() -> None:
     pwd = st.text_input("Admin password", type="password", key="admin_pwd")
     is_admin = pwd == ADMIN_PASSWORD
     if not is_admin:
-        st.caption("Enter admin password to review or approve corrections.")
+        st.caption("Enter admin password to review, approve, edit, retract, or download logs.")
         return
 
     st.success("Admin mode enabled")
@@ -1125,19 +1227,115 @@ def render_admin_panel() -> None:
     st.write(f"Approved corrections: **{len(approved)}**")
     st.write(f"Chat logs: **{len(chat_logs)}**")
 
+    st.markdown("### Export data")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if chat_logs:
+            st.download_button("Download chat_logs.json", data=export_json_bytes(chat_logs), file_name="chat_logs.json", mime="application/json", key="download_chat_logs_json")
+            st.download_button("Download chat_logs.csv", data=export_logs_to_csv_bytes(chat_logs), file_name="chat_logs.csv", mime="text/csv", key="download_chat_logs_csv")
+        else:
+            st.caption("No chat logs available yet.")
+    with col_b:
+        if pending:
+            st.download_button("Download pending_feedback.json", data=export_json_bytes(pending), file_name="pending_feedback.json", mime="application/json", key="download_pending_feedback_json")
+        if approved:
+            st.download_button("Download approved_corrections.json", data=export_json_bytes(approved), file_name="approved_corrections.json", mime="application/json", key="download_approved_corrections_json")
+
     if chat_logs:
         with st.expander("Recent chat logs", expanded=False):
             for row in reversed(chat_logs[-10:]):
                 st.markdown(f"**{row.get('created_at')}** | {row.get('user_email') or 'anonymous'}")
                 st.write("Q:", row.get("question"))
                 st.write("Route:", row.get("route"), "| top_score:", row.get("top_score"))
+                st.write("Authorized:", row.get("is_authorized"))
                 st.write("Flags:", row.get("flags"))
+                if row.get("approved_correction_question"):
+                    st.write("Approved correction used:", row.get("approved_correction_question"))
+                    st.write("Correction type:", row.get("approved_correction_type"), "| Strength:", row.get("approved_correction_strength"))
+                with st.expander("Final answer", expanded=False):
+                    st.markdown(row.get("final_answer") or "_No final answer saved_")
+                with st.expander("Raw answer", expanded=False):
+                    st.markdown(row.get("raw_answer") or "_No raw answer saved_")
                 if row.get("retrieved_chunks"):
-                    st.write("Retrieved chunks:")
-                    for ch in row["retrieved_chunks"][:3]:
-                        st.code(ch.get("text", "")[:800], language=None)
+                    with st.expander("Retrieved chunks", expanded=False):
+                        for ch in row["retrieved_chunks"][:5]:
+                            st.markdown(f"**Chunk {ch.get('chunk_no', '')}** | source={ch.get('source', 'unknown')} | page={ch.get('page', 'NA')}")
+                            st.code(ch.get("text", "")[:1200], language=None)
                 st.divider()
 
+    st.markdown("### Manage approved corrections")
+    if approved:
+        selected_correction_id = st.selectbox(
+            "Approved corrections",
+            options=[x["correction_id"] for x in approved],
+            format_func=lambda cid: next((f"{x['correction_id']} | {x.get('canonical_question', '')[:80]}" for x in approved if x["correction_id"] == cid), cid),
+            key="approved_correction_selector",
+        )
+        selected_corr = next(x for x in approved if x["correction_id"] == selected_correction_id)
+        st.json(selected_corr)
+
+        edit_canonical_question = st.text_input("Edit canonical question", value=selected_corr.get("canonical_question", ""), key="edit_canonical_question")
+        edit_corrected_answer = st.text_area("Edit corrected answer", value=selected_corr.get("corrected_answer", ""), height=180, key="edit_corrected_answer")
+        edit_topic = st.text_input("Edit topic", value=selected_corr.get("topic", ""), key="edit_topic")
+        edit_population = st.text_input("Edit population", value=selected_corr.get("population", ""), key="edit_population")
+        edit_source = st.text_input("Edit source", value=selected_corr.get("source", ""), key="edit_source")
+        source_type_options = ["expert_curated", "peer_reviewed", "official_guidance", "conference_material", "podcast_or_talk", "farm_sop", "user_claim"]
+        edit_source_type = st.selectbox("Edit source type", source_type_options, index=source_type_options.index(selected_corr.get("source_type", "expert_curated")) if selected_corr.get("source_type", "expert_curated") in source_type_options else 0, key="edit_source_type")
+        edit_confidence_tier = st.selectbox("Edit confidence tier", ["A", "B", "C"], index=["A", "B", "C"].index(selected_corr.get("confidence_tier", "A")) if selected_corr.get("confidence_tier", "A") in ["A", "B", "C"] else 0, key="edit_confidence_tier")
+        edit_correction_type = st.selectbox("Edit correction type", ["replace", "constrain", "cover", "structure"], index=["replace", "constrain", "cover", "structure"].index(selected_corr.get("correction_type", "constrain")) if selected_corr.get("correction_type", "constrain") in ["replace", "constrain", "cover", "structure"] else 1, key="edit_correction_type")
+        edit_strength = st.selectbox("Edit strength", ["high", "medium", "low"], index=["high", "medium", "low"].index(selected_corr.get("strength", "medium")) if selected_corr.get("strength", "medium") in ["high", "medium", "low"] else 1, key="edit_strength")
+        edit_aliases_raw = st.text_input("Edit aliases (split with |)", value=" | ".join(selected_corr.get("aliases", [])), key="edit_aliases_raw")
+        edit_must_include_raw = st.text_input("Edit must include (split with |)", value=" | ".join(selected_corr.get("must_include", [])), key="edit_must_include_raw")
+        edit_must_not_say_raw = st.text_input("Edit must NOT say (split with |)", value=" | ".join(selected_corr.get("must_not_say", [])), key="edit_must_not_say_raw")
+        edit_notes = st.text_area("Edit notes", value=selected_corr.get("notes", ""), key="edit_notes")
+
+        col_edit_1, col_edit_2, col_edit_3 = st.columns(3)
+        with col_edit_1:
+            if st.button("Save correction edit", key="save_correction_edit_btn"):
+                ok = update_approved_correction(
+                    correction_id=selected_correction_id,
+                    canonical_question=edit_canonical_question,
+                    corrected_answer=edit_corrected_answer,
+                    topic=edit_topic,
+                    population=edit_population,
+                    source=edit_source,
+                    source_type=edit_source_type,
+                    confidence_tier=edit_confidence_tier,
+                    correction_type=edit_correction_type,
+                    strength=edit_strength,
+                    aliases=[x.strip() for x in edit_aliases_raw.split("|") if x.strip()],
+                    must_include=[x.strip() for x in edit_must_include_raw.split("|") if x.strip()],
+                    must_not_say=[x.strip() for x in edit_must_not_say_raw.split("|") if x.strip()],
+                    notes=edit_notes,
+                    updated_by="admin_panel",
+                )
+                if ok:
+                    st.success("Approved correction updated.")
+                    st.rerun()
+        with col_edit_2:
+            current_active = bool(selected_corr.get("is_active", True))
+            if current_active:
+                if st.button("Deactivate correction", key="deactivate_correction_btn"):
+                    ok = set_approved_correction_active(selected_correction_id, False, updated_by="admin_panel")
+                    if ok:
+                        st.warning("Approved correction deactivated.")
+                        st.rerun()
+            else:
+                if st.button("Reactivate correction", key="reactivate_correction_btn"):
+                    ok = set_approved_correction_active(selected_correction_id, True, updated_by="admin_panel")
+                    if ok:
+                        st.success("Approved correction reactivated.")
+                        st.rerun()
+        with col_edit_3:
+            if st.button("Delete correction permanently", key="delete_correction_btn"):
+                ok = delete_approved_correction(selected_correction_id)
+                if ok:
+                    st.error("Approved correction deleted.")
+                    st.rerun()
+    else:
+        st.caption("No approved corrections available.")
+
+    st.markdown("### Review pending feedback")
     if not pending:
         st.caption("No pending feedback.")
         return
@@ -1155,11 +1353,7 @@ def render_admin_panel() -> None:
     topic = st.text_input("Topic", value=item.get("topic") or detect_topic(item.get("question", "")))
     population = st.text_input("Population", value=detect_population(item.get("question", "")))
     source = st.text_input("Trusted source", value=item.get("cited_source") or "Reviewer validated")
-    source_type = st.selectbox(
-        "Source type",
-        ["expert_curated", "peer_reviewed", "official_guidance", "conference_material", "podcast_or_talk", "farm_sop", "user_claim"],
-        index=0,
-    )
+    source_type = st.selectbox("Source type", source_type_options, index=0)
     confidence_tier = st.selectbox("Confidence tier", ["A", "B", "C"], index=0)
     correction_type = st.selectbox("Correction type", ["replace", "constrain", "cover", "structure"], index=1)
     strength = st.selectbox("Strength", ["high", "medium", "low"], index=1)
