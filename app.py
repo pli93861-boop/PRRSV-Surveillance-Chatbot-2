@@ -2,10 +2,8 @@ import os
 import re
 import time
 import json
-import csv
-import io
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -102,68 +100,6 @@ def _append_json_item(path: Path, item: Dict[str, Any]) -> None:
     _save_json_list(path, data)
 
 
-def check_admin_password() -> bool:
-    """Return True only when ADMIN_PASSWORD is set and the entered sidebar password matches it."""
-    if not ADMIN_PASSWORD:
-        return False
-    return st.session_state.get("admin_pwd", "") == ADMIN_PASSWORD
-
-
-def export_logs_to_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
-    """Export chat logs to a flat CSV for administrator download."""
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow([
-        "log_id",
-        "created_at",
-        "user_email",
-        "user_id",
-        "is_authorized",
-        "question",
-        "route",
-        "reason",
-        "top_score",
-        "approved_correction_id",
-        "approved_correction_question",
-        "flags",
-        "retrieved_chunks",
-        "raw_answer",
-        "final_answer",
-    ])
-
-    for row in rows:
-        flags = " | ".join([str(x) for x in (row.get("flags") or [])])
-        retrieved_chunks = row.get("retrieved_chunks") or []
-        retrieved_chunks_text = " || ".join([
-            f"Chunk {ch.get('chunk_no', '')}; source={ch.get('source', '')}; page={ch.get('page', '')}; text={str(ch.get('text', ''))[:500]}"
-            for ch in retrieved_chunks
-        ])
-        writer.writerow([
-            row.get("log_id"),
-            row.get("created_at"),
-            row.get("user_email"),
-            row.get("user_id"),
-            row.get("is_authorized"),
-            row.get("question"),
-            row.get("route"),
-            row.get("reason"),
-            row.get("top_score"),
-            row.get("approved_correction_id"),
-            row.get("approved_correction_question"),
-            flags,
-            retrieved_chunks_text,
-            row.get("raw_answer"),
-            row.get("final_answer"),
-        ])
-
-    return output.getvalue().encode("utf-8")
-
-
-def export_json_bytes(rows: List[Dict[str, Any]]) -> bytes:
-    """Export rows as JSON bytes for administrator download."""
-    return json.dumps(rows, ensure_ascii=False, indent=2, default=_json_safe).encode("utf-8")
-
-
 # ============================================================
 # Data models
 # ============================================================
@@ -200,6 +136,11 @@ class ApprovedCorrection:
     approved_by: str
     approved_at: str
     notes: str = ""
+    is_active: bool = True
+    updated_at: str = ""
+    updated_by: str = ""
+    correction_type: str = "constrain"   # replace | constrain | cover | structure
+    strength: str = "medium"             # high | medium | low
 
 
 GUARDRAILS = GuardrailConfig(enabled=True)
@@ -399,8 +340,11 @@ def text_similarity(a: str, b: str) -> float:
 
 
 
-def load_approved_corrections() -> List[ApprovedCorrection]:
-    return [ApprovedCorrection(**x) for x in _load_json_list(APPROVED_CORRECTIONS_FILE)]
+def load_approved_corrections(active_only: bool = True) -> List[ApprovedCorrection]:
+    rows = [ApprovedCorrection(**x) for x in _load_json_list(APPROVED_CORRECTIONS_FILE)]
+    if active_only:
+        rows = [x for x in rows if getattr(x, "is_active", True)]
+    return rows
 
 
 
@@ -426,6 +370,11 @@ def seed_default_corrections_if_missing() -> None:
             "approved_by": "system_seed",
             "approved_at": datetime.utcnow().isoformat(),
             "notes": "Default safeguard",
+            "is_active": True,
+            "updated_at": "",
+            "updated_by": "",
+            "correction_type": "replace",
+            "strength": "high",
         }
     ]
     _save_json_list(APPROVED_CORRECTIONS_FILE, defaults)
@@ -477,6 +426,38 @@ def detect_topic(question: str) -> str:
     if "stable" in q or "status" in q:
         return "herd_status"
     return "general"
+
+
+def apply_replacement_correction_if_needed(
+    correction: Optional[ApprovedCorrection],
+    user_input: str,
+    docs: List[Any],
+) -> Optional[str]:
+    if correction is None:
+        return None
+
+    ctype = (correction.correction_type or "constrain").lower()
+    strength = (correction.strength or "medium").lower()
+    if ctype != "replace":
+        return None
+
+    base = correction.corrected_answer.strip()
+    if not base:
+        return None
+
+    # High-strength replacement: use the correction as the authoritative answer core.
+    if strength == "high":
+        extras = []
+        if detect_topic(user_input) == "sample_type":
+            extras.append("Sample choice still depends on target population and surveillance objective.")
+        if docs:
+            extras.append("Additional retrieved evidence may provide context, but it should not contradict the corrected statement.")
+        if extras:
+            RETURN_MARKER
+        return base
+
+    # Medium/low replacement handled through prompting rather than hard overwrite.
+    return None
 
 
 
@@ -617,6 +598,8 @@ def approve_feedback_to_correction(
     population: str = "unknown",
     confidence_tier: str = "A",
     notes: str = "",
+    correction_type: str = "constrain",
+    strength: str = "medium",
 ) -> ApprovedCorrection:
     update_feedback_status(feedback_id, "approved")
     correction = ApprovedCorrection(
@@ -634,6 +617,8 @@ def approve_feedback_to_correction(
         approved_by=approved_by,
         approved_at=datetime.utcnow().isoformat(),
         notes=notes,
+        correction_type=correction_type,
+        strength=strength,
     )
     rows = _load_json_list(APPROVED_CORRECTIONS_FILE)
     rows.append(asdict(correction))
@@ -668,6 +653,8 @@ def log_chat_round(
         "top_score": float(result.get("top_score")) if result.get("top_score") is not None else None,
         "approved_correction_id": correction.correction_id if correction else None,
         "approved_correction_question": correction.canonical_question if correction else None,
+        "approved_correction_type": correction.correction_type if correction else None,
+        "approved_correction_strength": correction.strength if correction else None,
         "retrieved_chunks": [
             {
                 "chunk_no": int(i),
@@ -1056,7 +1043,15 @@ def answer_query(
             "top_score": top_score,
         }
 
-    if mode == "RAG":
+    replacement_answer = apply_replacement_correction_if_needed(
+        correction=approved_correction,
+        user_input=user_input,
+        docs=route_info["docs"],
+    )
+
+    if replacement_answer is not None:
+        answer = replacement_answer
+    elif mode == "RAG":
         answer = generate_rag_response(
             user_input,
             docs=route_info["docs"],
@@ -1114,11 +1109,10 @@ def render_admin_panel() -> None:
         st.info("Set ADMIN_PASSWORD env var to enable approval actions.")
         return
 
-    st.text_input("Admin password", type="password", key="admin_pwd")
-    is_admin = check_admin_password()
-
+    pwd = st.text_input("Admin password", type="password", key="admin_pwd")
+    is_admin = pwd == ADMIN_PASSWORD
     if not is_admin:
-        st.caption("Enter admin password to review, approve, reject, or download logs.")
+        st.caption("Enter admin password to review or approve corrections.")
         return
 
     st.success("Admin mode enabled")
@@ -1131,63 +1125,18 @@ def render_admin_panel() -> None:
     st.write(f"Approved corrections: **{len(approved)}**")
     st.write(f"Chat logs: **{len(chat_logs)}**")
 
-    st.markdown("### Export data")
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        if chat_logs:
-            st.download_button(
-                label="Download chat_logs.json",
-                data=export_json_bytes(chat_logs),
-                file_name="chat_logs.json",
-                mime="application/json",
-                key="download_chat_logs_json",
-            )
-            st.download_button(
-                label="Download chat_logs.csv",
-                data=export_logs_to_csv_bytes(chat_logs),
-                file_name="chat_logs.csv",
-                mime="text/csv",
-                key="download_chat_logs_csv",
-            )
-        else:
-            st.caption("No chat logs available yet.")
-
-    with col_b:
-        if pending:
-            st.download_button(
-                label="Download pending_feedback.json",
-                data=export_json_bytes(pending),
-                file_name="pending_feedback.json",
-                mime="application/json",
-                key="download_pending_feedback_json",
-            )
-        if approved:
-            st.download_button(
-                label="Download approved_corrections.json",
-                data=export_json_bytes(approved),
-                file_name="approved_corrections.json",
-                mime="application/json",
-                key="download_approved_corrections_json",
-            )
-
     if chat_logs:
         with st.expander("Recent chat logs", expanded=False):
             for row in reversed(chat_logs[-10:]):
                 st.markdown(f"**{row.get('created_at')}** | {row.get('user_email') or 'anonymous'}")
                 st.write("Q:", row.get("question"))
                 st.write("Route:", row.get("route"), "| top_score:", row.get("top_score"))
-                st.write("Authorized:", row.get("is_authorized"))
                 st.write("Flags:", row.get("flags"))
-                if row.get("approved_correction_question"):
-                    st.write("Approved correction used:", row.get("approved_correction_question"))
                 if row.get("retrieved_chunks"):
                     st.write("Retrieved chunks:")
                     for ch in row["retrieved_chunks"][:3]:
                         st.code(ch.get("text", "")[:800], language=None)
                 st.divider()
-
-    st.markdown("### Review pending feedback")
 
     if not pending:
         st.caption("No pending feedback.")
@@ -1196,10 +1145,7 @@ def render_admin_panel() -> None:
     selected_id = st.selectbox(
         "Pending feedback items",
         options=[x["feedback_id"] for x in pending],
-        format_func=lambda fid: next(
-            (f"{x['feedback_id']} | {x.get('question', '')[:80]}" for x in pending if x["feedback_id"] == fid),
-            fid
-        ),
+        format_func=lambda fid: next((f"{x['feedback_id']} | {x.get('question', '')[:80]}" for x in pending if x["feedback_id"] == fid), fid),
     )
     item = next(x for x in pending if x["feedback_id"] == selected_id)
     st.json(item)
@@ -1215,6 +1161,8 @@ def render_admin_panel() -> None:
         index=0,
     )
     confidence_tier = st.selectbox("Confidence tier", ["A", "B", "C"], index=0)
+    correction_type = st.selectbox("Correction type", ["replace", "constrain", "cover", "structure"], index=1)
+    strength = st.selectbox("Strength", ["high", "medium", "low"], index=1)
     must_include_raw = st.text_input("Must include phrases (split with |)", value="")
     must_not_say_raw = st.text_input("Must NOT say phrases (split with |)", value="")
     aliases_raw = st.text_input("Aliases (split with |)", value="")
@@ -1222,7 +1170,7 @@ def render_admin_panel() -> None:
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Approve correction", key="approve_correction_btn"):
+        if st.button("Approve correction"):
             correction = approve_feedback_to_correction(
                 feedback_id=selected_id,
                 canonical_question=canonical_question,
@@ -1237,12 +1185,13 @@ def render_admin_panel() -> None:
                 population=population,
                 confidence_tier=confidence_tier,
                 notes=notes,
+                correction_type=correction_type,
+                strength=strength,
             )
             st.success(f"Approved correction: {correction.correction_id}")
             st.rerun()
-
     with col2:
-        if st.button("Reject feedback", key="reject_feedback_btn"):
+        if st.button("Reject feedback"):
             update_feedback_status(selected_id, "rejected")
             st.warning("Feedback rejected")
             st.rerun()
